@@ -1,0 +1,84 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  test-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install uv and tools
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          export PATH="$HOME/.local/bin:$PATH"
+
+          if ! command -v kubectl &> /dev/null; then
+            curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+            chmod +x kubectl
+            sudo mv kubectl /usr/local/bin/ 2>/dev/null || mv kubectl $HOME/.local/bin/
+          fi
+
+          if ! command -v kind &> /dev/null; then
+            curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+            chmod +x ./kind
+            sudo mv ./kind /usr/local/bin/ 2>/dev/null || mv ./kind $HOME/.local/bin/
+          fi
+
+      - name: Start PostgreSQL container
+        run: |
+          docker rm -f ci-postgres 2>/dev/null || true
+          docker run -d --name ci-postgres \
+            -e POSTGRES_USER=postgres \
+            -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_DB=agent_relay \
+            -p 5432:5432 \
+            postgres:16-alpine
+
+          for i in {1..30}; do
+            if docker exec ci-postgres pg_isready -U postgres -d agent_relay; then
+              echo "PostgreSQL is ready!"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Run starter and integration tests against PostgreSQL
+        env:
+          RELAY_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/agent_relay
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          uv sync
+          uv run pytest -v
+
+      - name: Cleanup PostgreSQL test container
+        if: always()
+        run: |
+          docker rm -f ci-postgres 2>/dev/null || true
+
+      - name: Build and deploy to kind cluster
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          TAG="v-$(date +%s)"
+          IMAGE="agent-relay:$TAG"
+
+          echo "Building image $IMAGE..."
+          docker build -t "$IMAGE" .
+
+          echo "Loading image $IMAGE into kind..."
+          kind load docker-image "$IMAGE"
+
+          echo "Updating deployment image to $IMAGE..."
+          kubectl set image deployment/agent-relay agent-relay="$IMAGE"
+
+          echo "Waiting for rollout to finish..."
+          kubectl rollout status deployment/agent-relay --timeout=90s
+
+          echo "Deployment of $IMAGE successfully completed!"
