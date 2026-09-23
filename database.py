@@ -19,7 +19,12 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, rela
 
 
 def _database_url() -> str:
-    return os.getenv("RELAY_DATABASE_URL") or os.getenv("DATABASE_URL") or "sqlite:///./agent-relay.db"
+    url = os.getenv("RELAY_DATABASE_URL") or os.getenv("DATABASE_URL") or "sqlite:///./agent-relay.db"
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql+psycopg://", 1)
+    elif url.startswith("postgresql://") and not url.startswith("postgresql+"):
+        url = url.replace("postgresql://", "postgresql+psycopg://", 1)
+    return url
 
 
 def positive_int(name: str, default: int) -> int:
@@ -141,6 +146,8 @@ if _is_sqlite(DATABASE_URL):
         from sqlalchemy.pool import StaticPool
 
         engine_kwargs["poolclass"] = StaticPool
+else:
+    engine_kwargs.update({"pool_size": 20, "max_overflow": 10})
 
 engine: Engine = create_engine(DATABASE_URL, **engine_kwargs)
 
@@ -177,24 +184,27 @@ def db_session() -> Generator[Session, None, None]:
 
 @contextmanager
 def immediate_transaction() -> Generator[Session, None, None]:
-    """Run one SQLite writer transaction before selecting or changing work.
+    """Run one writer transaction before selecting or changing work.
 
-    SQLite does not support PostgreSQL's ``FOR UPDATE SKIP LOCKED``.  A
-    ``BEGIN IMMEDIATE`` writer reservation serializes claims (and recovery or
-    terminal submissions) across API processes, giving each task one active
-    lease.  This is the intentionally isolated seam for a future PostgreSQL
-    implementation.
+    For SQLite, a BEGIN IMMEDIATE writer reservation serializes claims across
+    processes. For PostgreSQL, transactions use standard isolation and row-level locks.
     """
 
     connection = engine.connect()
     session = Session(bind=connection, expire_on_commit=False, autoflush=True)
     try:
-        connection.exec_driver_sql("BEGIN IMMEDIATE")
-        yield session
-        session.flush()
-        connection.commit()
+        if _is_sqlite(DATABASE_URL):
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+            yield session
+            session.flush()
+            connection.commit()
+        else:
+            with connection.begin():
+                yield session
+                session.flush()
     except Exception:
-        connection.rollback()
+        if _is_sqlite(DATABASE_URL):
+            connection.rollback()
         raise
     finally:
         session.close()
@@ -205,13 +215,14 @@ def recover_expired_in_session(db: Session, now: datetime) -> int:
     """Expire active leases and requeue/fail their tasks within ``db``."""
 
     now_db = as_db_time(now)
-    expired = list(
-        db.scalars(
-            select(Attempt)
-            .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
-            .order_by(Attempt.lease_expires_at, Attempt.id)
-        )
+    query = (
+        select(Attempt)
+        .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
+        .order_by(Attempt.lease_expires_at, Attempt.id)
     )
+    if not _is_sqlite(DATABASE_URL):
+        query = query.with_for_update(skip_locked=True)
+    expired = list(db.scalars(query))
     count = 0
     for attempt in expired:
         task = db.get(Task, attempt.task_id)
@@ -251,6 +262,7 @@ __all__ = [
     "MAX_PAGE_SIZE",
     "RECOVERY_INTERVAL_SECONDS",
     "Task",
+    "_is_sqlite",
     "as_db_time",
     "db_session",
     "db_time",
